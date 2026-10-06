@@ -199,6 +199,92 @@ def main() -> int:
     }, expect_status=400)
     assert mb3["error"] == "invalid_payload", mb3
 
+    # 13. 反向通行时间窗：导入一张 E5 在 13:00–16:00 反向的图
+    #     窗内仅允许 TOWER→LAKE；窗内 LAKE→TOWER（正向）须等到 16:00
+    rev_graph = {
+        "nodes": ["GATE", "PLAZA", "HILL", "LAKE", "TOWER"],
+        "edges": [
+            {"id": "E1", "from": "GATE",  "to": "PLAZA", "travel_seconds": 180, "has_stairs": False},
+            {"id": "E2", "from": "PLAZA", "to": "HILL",  "travel_seconds": 240, "has_stairs": True},
+            {"id": "E3", "from": "PLAZA", "to": "LAKE",  "travel_seconds": 300, "has_stairs": False},
+            {"id": "E4", "from": "HILL",  "to": "TOWER", "travel_seconds": 120, "has_stairs": True},
+            {"id": "E5", "from": "LAKE",  "to": "TOWER", "travel_seconds": 240, "has_stairs": False},
+            {"id": "E6", "from": "PLAZA", "to": "TOWER", "travel_seconds": 600, "has_stairs": True},
+        ],
+        "reverse_windows": {
+            "E5": [{"start": "2026-10-05T13:00:00Z",
+                    "end": "2026-10-05T16:00:00Z"}],
+        },
+    }
+    status, pub = call("POST", "/admin/graph", rev_graph)
+    assert status == 200, pub
+
+    # 13a. 窗内反向：TOWER 14:00 → LAKE 14:04，direction=reverse
+    status, rrev = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T14:00:00Z",
+    })
+    assert rrev["edge_sequence"] == ["E5"], rrev
+    (seg,) = rrev["segments"]
+    assert seg["from_node"] == "TOWER" and seg["to_node"] == "LAKE", seg
+    assert seg["direction"] == "reverse", seg
+    assert (seg["enter_time"], seg["leave_time"]) == (
+        "2026-10-05T14:00:00Z", "2026-10-05T14:04:00Z"), seg
+    print("反向窗查询:", seg["from_node"], "->", seg["to_node"], seg["direction"])
+
+    # 13b. 窗外想反向：12:00 从 TOWER 出发，在节点等到 13:00 再反向进入
+    status, rwait = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T12:00:00Z",
+    })
+    (seg,) = rwait["segments"]
+    assert seg["direction"] == "reverse" and seg["waiting_seconds"] == 3600, seg
+    assert seg["enter_time"] == "2026-10-05T13:00:00Z", seg
+
+    # 13c. 窗内想正向：14:00 LAKE → TOWER 须等到 16:00，direction=forward
+    status, rfwd = call("POST", "/api/route", {
+        "origin": "LAKE", "destination": "TOWER",
+        "departure_time": "2026-10-05T14:00:00Z",
+    })
+    (seg,) = rfwd["segments"]
+    assert seg["direction"] == "forward", seg
+    assert seg["enter_time"] == "2026-10-05T16:00:00Z", seg
+    assert rfwd["arrival_time"] == "2026-10-05T16:04:00Z", rfwd
+
+    # 13d. 窗外反向且此后无窗：17:00 TOWER → LAKE 不可达 → 404
+    status, nr2 = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T17:00:00Z",
+    }, expect_status=404)
+    assert nr2["error"] == "no_route", nr2
+
+    # 14. 反向窗非法（重叠）整次导入拒绝，旧版本保留
+    bad_rev = dict(rev_graph)
+    bad_rev["reverse_windows"] = {
+        "E5": [
+            {"start": "2026-10-05T13:00:00Z", "end": "2026-10-05T15:00:00Z"},
+            {"start": "2026-10-05T14:00:00Z", "end": "2026-10-05T16:00:00Z"},
+        ],
+    }
+    before_v = call("GET", "/version")[1]
+    status, rejected = call("POST", "/admin/graph", bad_rev, expect_status=400)
+    assert rejected["error"] == "invalid_payload" and rejected["rejected"] is True
+    after_v = call("GET", "/version")[1]
+    assert before_v["data_version"] == after_v["data_version"] == rejected["active_version"]
+    print(f"重叠反向窗被拒绝，保留版本 v{after_v['data_version']}")
+
+    # 15. 不带 reverse_windows 的图仍可正常导入（向后兼容）
+    status, pub2 = call("POST", "/admin/graph", {
+        "nodes": ["X", "Y"],
+        "edges": [{"id": "X1", "from": "X", "to": "Y",
+                   "travel_seconds": 30, "has_stairs": False}],
+    })
+    assert status == 200, pub2
+    status, rcomp = call("POST", "/api/route", {
+        "origin": "X", "destination": "Y", "departure_time": 0,
+    })
+    assert rcomp["segments"][0]["direction"] == "forward", rcomp
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

@@ -5,7 +5,7 @@
 """
 from typing import Any
 
-from .timeutil import TimeError, parse_time
+from .timeutil import TimeError, format_time, parse_time
 
 
 class ValidationError(ValueError):
@@ -42,6 +42,73 @@ def _validate_stairs(value: Any) -> bool:
     return value
 
 
+def _normalize_reverse_windows(
+    raw: Any, edge_ids: set[str]
+) -> list[dict]:
+    """校验反向通行时间窗（按路段分组）。
+
+    期望格式（键为路段编号，值为半开时间窗数组）::
+
+        {"reverse_windows": {
+            "E1": [{"start": "2026-10-05T08:00:00Z",
+                    "end":   "2026-10-05T10:00:00Z"}]}}
+
+    每个窗为半开 ``[start, end)``，必须满足 ``start < end``；同一路段的
+    窗两两不得重叠（端点相接允许：``[a,b)`` 与 ``[b,c)`` 合法）。窗内只
+    允许原终点走向原起点，窗外只允许原方向。
+    """
+    if not isinstance(raw, dict):
+        raise ValidationError("reverse_windows 必须是对象（路段编号 -> 时间窗数组）")
+
+    # 先规范化键（拒绝 bool、非字符串/整数、空串），再按编号稳定排序报错
+    keyed: list[tuple[str, Any]] = []
+    for raw_key in raw.keys():
+        edge_key = _clean_identifier(raw_key, "reverse_windows 的路段编号")
+        keyed.append((edge_key, raw[raw_key]))
+    keyed.sort(key=lambda kv: kv[0])
+
+    windows: list[dict] = []
+    for edge_id, raw_wins in keyed:
+        if edge_id not in edge_ids:
+            raise ValidationError(
+                f"reverse_windows[{edge_id!r}] 引用了不存在的路段: {edge_id!r}"
+            )
+        if not isinstance(raw_wins, list):
+            raise ValidationError(f"reverse_windows[{edge_id!r}] 必须是数组")
+
+        intervals: list[tuple[int, int]] = []
+        for j, item in enumerate(raw_wins):
+            where = f"reverse_windows[{edge_id!r}][{j}]"
+            if not isinstance(item, dict):
+                raise ValidationError(f"{where} 必须是对象")
+            if "start" not in item:
+                raise ValidationError(f"{where} 缺少 start")
+            if "end" not in item:
+                raise ValidationError(f"{where} 缺少 end")
+            try:
+                start = parse_time(item["start"])
+                end = parse_time(item["end"])
+            except TimeError as exc:
+                raise ValidationError(f"{where}: {exc}") from None
+            if start >= end:
+                raise ValidationError(
+                    f"{where} 无效时间窗: start({item['start']}) 必须早于 end({item['end']})"
+                )
+            intervals.append((start, end))
+
+        intervals.sort()
+        for (s1, e1), (s2, e2) in zip(intervals, intervals[1:]):
+            if s2 < e1:
+                raise ValidationError(
+                    f"reverse_windows[{edge_id!r}] 存在重叠时间窗: "
+                    f"[{format_time(s1)}, {format_time(e1)}) 与 "
+                    f"[{format_time(s2)}, {format_time(e2)})"
+                )
+        for start, end in intervals:
+            windows.append({"edge_id": edge_id, "start": start, "end": end})
+    return windows
+
+
 def normalize_graph(payload: Any) -> dict:
     """校验步道图导入负载，返回规范化结构。
 
@@ -53,7 +120,10 @@ def normalize_graph(payload: Any) -> dict:
             {"id": "E1", "from": "gate", "to": "plaza",
              "travel_seconds": 120, "has_stairs": false},
             ...
-          ]
+          ],
+          "reverse_windows": {              # 可选，缺省行为不变
+            "E1": [{"start": "...", "end": "..."}]
+          }
         }
     """
     data = _require_object(payload, "步道图")
@@ -105,8 +175,13 @@ def normalize_graph(payload: Any) -> dict:
             }
         )
 
+    # 反向通行时间窗可选；未配置时行为与旧版本完全一致
+    reverse_windows: list[dict] = []
+    if "reverse_windows" in data and data["reverse_windows"] is not None:
+        reverse_windows = _normalize_reverse_windows(data["reverse_windows"], edge_ids)
+
     # 允许空图；允许自环（正秒数下不会被最短路采用）
-    return {"nodes": nodes, "edges": edges}
+    return {"nodes": nodes, "edges": edges, "reverse_windows": reverse_windows}
 
 
 def normalize_closures(payload: Any, known_edges: set[str]) -> list[dict]:

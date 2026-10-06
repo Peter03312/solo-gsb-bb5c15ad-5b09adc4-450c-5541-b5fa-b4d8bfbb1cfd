@@ -33,6 +33,8 @@ def _segment_to_dict(seg) -> dict:
         "edge_id": seg.edge_id,
         "from_node": seg.from_node,
         "to_node": seg.to_node,
+        # 实际通行方向：forward 原方向（from->to），reverse 反向窗内原终点->原起点
+        "direction": seg.direction,
         "has_stairs": seg.has_stairs,
         "enter_time": format_time(seg.enter_time),
         "enter_time_epoch": seg.enter_time,
@@ -148,6 +150,7 @@ async def version():
             "nodes": len(snap.nodes),
             "edges": len(snap.edges),
             "closures": len(snap.closures),
+            "reverse_windows": len(snap.reverse_windows),
         }
     finally:
         conn.close()

@@ -56,8 +56,18 @@ CREATE TABLE IF NOT EXISTS closures (
     PRIMARY KEY (version_id, closure_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_edges_from     ON edges(version_id, from_node);
-CREATE INDEX IF NOT EXISTS idx_closures_edge ON closures(version_id, edge_id);
+CREATE TABLE IF NOT EXISTS reverse_windows (
+    version_id  INTEGER NOT NULL,
+    edge_id     TEXT NOT NULL,
+    win_index   INTEGER NOT NULL,
+    start_ts    INTEGER NOT NULL,
+    end_ts      INTEGER NOT NULL CHECK (end_ts > start_ts),
+    PRIMARY KEY (version_id, edge_id, win_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_from        ON edges(version_id, from_node);
+CREATE INDEX IF NOT EXISTS idx_closures_edge     ON closures(version_id, edge_id);
+CREATE INDEX IF NOT EXISTS idx_reverse_windows_edge ON reverse_windows(version_id, edge_id);
 """
 
 
@@ -75,6 +85,12 @@ class ClosureRow(NamedTuple):
     end: int
 
 
+class ReverseWindowRow(NamedTuple):
+    edge_id: str
+    start: int
+    end: int
+
+
 class Snapshot(NamedTuple):
     """单次查询使用的不可变数据版本。"""
 
@@ -82,6 +98,8 @@ class Snapshot(NamedTuple):
     nodes: list[str]
     edges: list[EdgeRow]
     closures: list[ClosureRow]
+    # 默认可缺省：未配置反向窗的版本/测试构造行为不变
+    reverse_windows: list[ReverseWindowRow] = []
 
     @property
     def node_set(self) -> set[str]:
@@ -141,6 +159,11 @@ def _copy_version(conn: sqlite3.Connection, old: int, new: int, kind: str) -> No
             "SELECT ?, closure_id, edge_id, start_ts, end_ts FROM closures WHERE version_id=?",
             (new, old),
         )
+        conn.execute(
+            "INSERT INTO reverse_windows(version_id, edge_id, win_index, start_ts, end_ts) "
+            "SELECT ?, edge_id, win_index, start_ts, end_ts FROM reverse_windows WHERE version_id=?",
+            (new, old),
+        )
 
 
 def publish_graph(conn: sqlite3.Connection, payload) -> int:
@@ -174,7 +197,21 @@ def publish_graph(conn: sqlite3.Connection, payload) -> int:
                 for e in graph["edges"]
             ],
         )
-        # 丢弃悬挂封闭记录
+        # 反向通行窗整体替换（旧版本复制过来的先清空再写入新图配置）。
+        # normalize_graph 返回的列表已按 (路段编号, 窗起点) 排序。
+        conn.execute("DELETE FROM reverse_windows WHERE version_id=?", (new,))
+        win_index_by_edge: dict[str, int] = {}
+        win_rows = []
+        for w in graph["reverse_windows"]:
+            j = win_index_by_edge.get(w["edge_id"], 0)
+            win_index_by_edge[w["edge_id"]] = j + 1
+            win_rows.append((new, w["edge_id"], j, w["start"], w["end"]))
+        conn.executemany(
+            "INSERT INTO reverse_windows(version_id, edge_id, win_index, start_ts, end_ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            win_rows,
+        )
+        # 丢弃悬挂封闭记录（引用新图中不存在路段的旧封闭）
         conn.execute("DELETE FROM closures WHERE version_id=? AND edge_id NOT IN (%s)" %
                      (",".join("?" * len(new_edge_ids)) if new_edge_ids else "''"),
                      (new, *sorted(new_edge_ids)) if new_edge_ids else (new,))
@@ -240,7 +277,13 @@ def get_snapshot(conn: sqlite3.Connection, version_id: Optional[int] = None) -> 
             "SELECT edge_id, start_ts, end_ts FROM closures WHERE version_id=? "
             "ORDER BY closure_id", (version_id,))
     ]
-    return Snapshot(version_id, nodes, edges, closures)
+    reverse_windows = [
+        ReverseWindowRow(r["edge_id"], r["start_ts"], r["end_ts"])
+        for r in conn.execute(
+            "SELECT edge_id, start_ts, end_ts FROM reverse_windows WHERE version_id=? "
+            "ORDER BY edge_id, win_index", (version_id,))
+    ]
+    return Snapshot(version_id, nodes, edges, closures, reverse_windows)
 
 
 def current_version(conn: sqlite3.Connection) -> int:
