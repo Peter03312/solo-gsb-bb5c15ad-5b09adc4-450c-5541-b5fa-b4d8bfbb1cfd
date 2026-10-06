@@ -33,8 +33,9 @@ def cmd_init_db(args) -> int:
         return 0
     if args.force:
         conn.executescript(
-            "DELETE FROM closures; DELETE FROM edges; DELETE FROM nodes; "
-            "DELETE FROM versions; UPDATE meta SET value='0' WHERE key='current_version';"
+            "DELETE FROM closures; DELETE FROM reverse_windows; DELETE FROM edges; "
+            "DELETE FROM nodes; DELETE FROM versions; "
+            "UPDATE meta SET value='0' WHERE key='current_version';"
         )
     graph_file = args.graph or config.SEED_GRAPH_FILE
     closures_file = args.closures or config.SEED_CLOSURES_FILE

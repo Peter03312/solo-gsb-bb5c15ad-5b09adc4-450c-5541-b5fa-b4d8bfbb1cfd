@@ -56,8 +56,18 @@ CREATE TABLE IF NOT EXISTS closures (
     PRIMARY KEY (version_id, closure_id)
 );
 
+CREATE TABLE IF NOT EXISTS reverse_windows (
+    version_id  INTEGER NOT NULL,
+    edge_id     TEXT NOT NULL,
+    window_idx  INTEGER NOT NULL,
+    start_ts    INTEGER NOT NULL,
+    end_ts      INTEGER NOT NULL CHECK (end_ts > start_ts),
+    PRIMARY KEY (version_id, edge_id, window_idx)
+);
+
 CREATE INDEX IF NOT EXISTS idx_edges_from     ON edges(version_id, from_node);
 CREATE INDEX IF NOT EXISTS idx_closures_edge ON closures(version_id, edge_id);
+CREATE INDEX IF NOT EXISTS idx_reverse_edge  ON reverse_windows(version_id, edge_id);
 """
 
 
@@ -75,6 +85,12 @@ class ClosureRow(NamedTuple):
     end: int
 
 
+class ReverseWindowRow(NamedTuple):
+    edge_id: str
+    start: int
+    end: int
+
+
 class Snapshot(NamedTuple):
     """单次查询使用的不可变数据版本。"""
 
@@ -82,6 +98,7 @@ class Snapshot(NamedTuple):
     nodes: list[str]
     edges: list[EdgeRow]
     closures: list[ClosureRow]
+    reverse_windows: list[ReverseWindowRow] = []
 
     @property
     def node_set(self) -> set[str]:
@@ -141,6 +158,12 @@ def _copy_version(conn: sqlite3.Connection, old: int, new: int, kind: str) -> No
             "SELECT ?, closure_id, edge_id, start_ts, end_ts FROM closures WHERE version_id=?",
             (new, old),
         )
+        conn.execute(
+            "INSERT INTO reverse_windows(version_id, edge_id, window_idx, start_ts, end_ts) "
+            "SELECT ?, edge_id, window_idx, start_ts, end_ts FROM reverse_windows "
+            "WHERE version_id=?",
+            (new, old),
+        )
 
 
 def publish_graph(conn: sqlite3.Connection, payload) -> int:
@@ -172,6 +195,17 @@ def publish_graph(conn: sqlite3.Connection, payload) -> int:
             [
                 (new, e["id"], e["src"], e["dst"], e["seconds"], 1 if e["has_stairs"] else 0)
                 for e in graph["edges"]
+            ],
+        )
+        # 反向时间窗随新图整体替换（校验已在事务前完成）
+        conn.execute("DELETE FROM reverse_windows WHERE version_id=?", (new,))
+        conn.executemany(
+            "INSERT INTO reverse_windows(version_id, edge_id, window_idx, start_ts, end_ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (new, e["id"], idx, start, end)
+                for e in graph["edges"]
+                for idx, (start, end) in enumerate(e["reverse_windows"])
             ],
         )
         # 丢弃悬挂封闭记录
@@ -240,7 +274,13 @@ def get_snapshot(conn: sqlite3.Connection, version_id: Optional[int] = None) -> 
             "SELECT edge_id, start_ts, end_ts FROM closures WHERE version_id=? "
             "ORDER BY closure_id", (version_id,))
     ]
-    return Snapshot(version_id, nodes, edges, closures)
+    reverse_windows = [
+        ReverseWindowRow(r["edge_id"], r["start_ts"], r["end_ts"])
+        for r in conn.execute(
+            "SELECT edge_id, start_ts, end_ts FROM reverse_windows WHERE version_id=? "
+            "ORDER BY edge_id, window_idx", (version_id,))
+    ]
+    return Snapshot(version_id, nodes, edges, closures, reverse_windows)
 
 
 def current_version(conn: sqlite3.Connection) -> int:
@@ -259,6 +299,7 @@ def export_json(conn: sqlite3.Connection, path: Path) -> None:
                 "nodes": snap.nodes,
                 "edges": [e._asdict() | {"has_stairs": e.has_stairs} for e in snap.edges],
                 "closures": [c._asdict() for c in snap.closures],
+                "reverse_windows": [w._asdict() for w in snap.reverse_windows],
             },
             ensure_ascii=False,
             indent=2,

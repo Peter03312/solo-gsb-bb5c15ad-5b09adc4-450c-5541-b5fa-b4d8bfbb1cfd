@@ -11,10 +11,27 @@
 因此允许恰好在封闭结束时刻 ``end`` 进入路段，也允许在 ``end`` 之前
 停在节点上等候；通行区间一旦开始就不能与任何封闭区间重叠。
 
+反向通行时间窗
+==============
+每条路段可携带一组互不重叠的半开时间窗。对从 ``from`` 到 ``to`` 的
+有向路段：
+
+- **进入时刻**落在某个窗 ``[start, end)`` 内时，只允许**反向**
+  （从原终点 ``to`` 走向原起点 ``from``）；
+- 其余时刻只允许原方向；
+- 方向只在**进入**路段的时刻判定；进入后若通行途中跨过窗边界
+  （包括开始与结束边界），仍按进入时确定的方向走完全程；
+- 封闭记录对两个方向同样生效：整个通行区间 ``[enter, leave)`` 仍
+  不得与该边任何封闭区间重叠，可在节点等待到可行时刻再进入；
+- 未配置反向窗的路段行为不变。
+
+上述判定给出一个关于就绪时刻单调非降（FIFO）的最早进入函数，故
+时间依赖 Dijkstra 与多标签选路的正确性不变。
+
 算法
 ====
 第一阶段：时间依赖的标号设定（Dijkstra 变种）。
-``earliest_departure`` 在 FIFO 假设下（晚出发不会更早通过同一条边）
+``earliest_enter`` 在 FIFO 假设下（晚出发不会更早通过同一条边）
 保证最早到达时刻正确，得到终点最早到达 ``T``。
 
 第二阶段：在“到达终点不晚于 T”的状态空间做多标号搜索，状态键为
@@ -147,6 +164,7 @@ class RouteEngine:
     def __init__(self, snapshot: Snapshot):
         self.version_id = snapshot.version_id
         self._adj: dict[str, list[Edge]] = defaultdict(list)
+        self._rev_adj: dict[str, list[Edge]] = defaultdict(list)
         self._edges: dict[str, Edge] = {}
         for row in snapshot.edges:
             edge = Edge(row.id, row.src, row.dst, row.seconds, row.has_stairs)
@@ -154,7 +172,12 @@ class RouteEngine:
                 raise ValueError(f"路段编号在版本内重复: {edge.id}")
             self._edges[edge.id] = edge
             self._adj[edge.src].append(edge)
+            if edge.dst != edge.src:
+                # 自环的反向即原方向本身，不重复登记
+                self._rev_adj[edge.dst].append(edge)
         for edges in self._adj.values():
+            edges.sort(key=lambda e: e.id)
+        for edges in self._rev_adj.values():
             edges.sort(key=lambda e: e.id)
 
         self._closures: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -163,27 +186,97 @@ class RouteEngine:
         for intervals in self._closures.values():
             intervals.sort()
 
-    def _neighbors(self, node: str, avoid_stairs: bool) -> list[Edge]:
-        edges = self._adj.get(node, ())
-        if avoid_stairs:
-            return [e for e in edges if not e.has_stairs]
-        return list(edges)
+        self._reverse_windows: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for w in snapshot.reverse_windows:
+            self._reverse_windows[w.edge_id].append((w.start, w.end))
+        for intervals in self._reverse_windows.values():
+            intervals.sort()
+
+    def _options(self, node: str, avoid_stairs: bool) -> list[tuple[Edge, bool]]:
+        """从 ``node`` 可扩展的 ``(路段, 是否反向)`` 列表。
+
+        反向选项是否真正可用由 :meth:`earliest_enter` 按进入时刻判定；
+        这里只给出“在某段时间窗内可能可用”的边（即配置了反向窗的入边）。
+        """
+        options: list[tuple[Edge, bool]] = [
+            (e, False) for e in self._adj.get(node, ())
+            if not (avoid_stairs and e.has_stairs)
+        ]
+        for e in self._rev_adj.get(node, ()):
+            if avoid_stairs and e.has_stairs:
+                continue
+            if not self._reverse_windows.get(e.id):
+                continue  # 未配置反向窗：反向恒不可用
+            options.append((e, True))
+        options.sort(key=lambda item: (item[0].id, item[1]))
+        return options
 
     def earliest_departure(self, edge: Edge, ready_at: int) -> int:
-        """在 ``ready_at`` 或之后，最早可以进入该路段的时刻。
+        """原方向在 ``ready_at`` 或之后最早可以进入该路段的时刻（兼容接口）。
 
         若按当前时刻进入会与某条封闭区间重叠，则把进入时刻推迟到该封闭
         区间结束（半开区间，结束时刻立即可通行）后重新检查。
         """
+        enter = self.earliest_enter(edge, ready_at, reverse=False)
+        if enter is None:  # 无反向窗时不会发生；防御性处理
+            raise NoRouteError("内部错误：原方向无可用时间窗")
+        return enter
+
+    def earliest_enter(self, edge: Edge, ready_at: int, reverse: bool) -> Optional[int]:
+        """在 ``ready_at`` 或之后，按指定方向最早可以进入该路段的时刻。
+
+        同时满足两类约束：
+
+        1. 封闭记录：整个通行区间 ``[enter, enter + seconds)`` 不得与该边
+           任何封闭区间重叠；可在节点等待封闭结束；
+        2. 反向时间窗：反向通行的进入时刻必须落在某个
+           ``[win_start, win_end)`` 内，原方向的进入时刻必须落在所有
+           时间窗之外（等待到窗结束）。未配置反向窗时两个方向都只有
+           原方向可行。
+
+        返回最早进入时刻；该方向此后无可用时间窗时返回 ``None``。
+        方向只按进入时刻判定，故等待封闭而越过窗边界时需要重新选向。
+        """
         t = ready_at
-        for start, end in self._closures.get(edge.id, ()):
-            if end <= t:
-                continue
-            if start >= t + edge.seconds:
-                break  # 已按 start 排序，后面的封闭更不可能重叠
-            if _overlaps(t, t + edge.seconds, start, end):
-                t = end
-        return t
+        windows = self._reverse_windows.get(edge.id, ())
+        while True:
+            # 1) 封闭约束：等待到通行区间完全不与任何封闭区间重叠
+            blocked = False
+            for start, end in self._closures.get(edge.id, ()):
+                if end <= t:
+                    continue
+                if start >= t + edge.seconds:
+                    break  # 已按 start 排序，后面的封闭更不可能重叠
+                if _overlaps(t, t + edge.seconds, start, end):
+                    t = end
+                    blocked = True
+                    break
+            if blocked:
+                continue  # 越过封闭结束时刻后，可能也越过了窗边界，重检
+            # 2) 反向时间窗约束（窗对两个方向都强制选向）
+            if not windows:
+                return None if reverse else t
+            containing = None  # t 所在的窗（半开）
+            next_start = None  # t 之后第一个开始的窗
+            for win_start, win_end in windows:
+                if win_end <= t:
+                    continue
+                if win_start <= t < win_end:
+                    containing = (win_start, win_end)
+                elif win_start > t:
+                    next_start = win_start
+                    break  # 已按 start 排序
+            if reverse:
+                if containing is not None:
+                    return t
+                if next_start is None:
+                    return None  # 之后再无反向窗
+                t = next_start  # 在节点等待下一反向窗开放
+            else:
+                if containing is None:
+                    return t
+                t = containing[1]  # 窗内原方向禁行，等待窗结束
+            # 跨越窗边界后重新检查封闭区间
 
     # ------------------------------------------------------------------
     # 第一阶段：最早到达时刻
@@ -197,12 +290,15 @@ class RouteEngine:
             t, u = heapq.heappop(heap)
             if t != dist[u]:
                 continue
-            for edge in self._neighbors(u, avoid_stairs):
-                enter = self.earliest_departure(edge, t)
+            for edge, reversed_dir in self._options(u, avoid_stairs):
+                enter = self.earliest_enter(edge, t, reversed_dir)
+                if enter is None:
+                    continue
+                v = edge.src if reversed_dir else edge.dst
                 arrival = enter + edge.seconds
-                if arrival < dist.get(edge.dst, float("inf")):
-                    dist[edge.dst] = arrival
-                    heapq.heappush(heap, (arrival, edge.dst))
+                if arrival < dist.get(v, float("inf")):
+                    dist[v] = arrival
+                    heapq.heappush(heap, (arrival, v))
         return dist
 
     # ------------------------------------------------------------------
@@ -254,24 +350,27 @@ class RouteEngine:
             if (t, seq) not in labels.get(u, ()):
                 continue  # 已被支配后移除的过期标签
 
-            for edge in self._neighbors(u, avoid_stairs):
-                enter = self.earliest_departure(edge, t)
+            for edge, reversed_dir in self._options(u, avoid_stairs):
+                enter = self.earliest_enter(edge, t, reversed_dir)
+                if enter is None:
+                    continue
+                v = edge.src if reversed_dir else edge.dst
                 leave = enter + edge.seconds
                 if leave > deadline:
                     continue  # 不可能参与“最早到达 T”的路线
                 new_seq = seq + (edge.id,)
                 new_label = (leave, new_seq)
 
-                existing = labels[edge.dst]
+                existing = labels[v]
                 if any(self._dominates(et, es, leave, new_seq) for et, es in existing):
                     continue
                 # 新标签支配旧标签则移除（前缀不可比的保留）
-                labels[edge.dst] = [
+                labels[v] = [
                     (et, es) for et, es in existing
                     if not self._dominates(leave, new_seq, et, es)
                 ]
-                labels[edge.dst].append(new_label)
-                heapq.heappush(heap, (leave, new_seq, edge.dst))
+                labels[v].append(new_label)
+                heapq.heappush(heap, (leave, new_seq, v))
 
         best = min(labels.get(destination, ()), default=None, key=lambda item: (item[0], item[1]))
         if best is None:
@@ -306,13 +405,18 @@ class RouteEngine:
         clock = departure
         for edge_id in best_seq:
             edge = self._edges[edge_id]
-            enter = self.earliest_departure(edge, clock)
+            # 方向按当前所在节点判定（重放进入时刻与搜索阶段一致）
+            reversed_dir = current == edge.dst and current != edge.src
+            enter = self.earliest_enter(edge, clock, reversed_dir)
+            if enter is None:
+                raise NoRouteError("内部错误：获胜序列在重放时不可行")
+            next_node = edge.src if reversed_dir else edge.dst
             leave = enter + edge.seconds
             segments.append(
                 Segment(
                     edge_id=edge.id,
                     from_node=current,
-                    to_node=edge.dst,
+                    to_node=next_node,
                     enter_time=enter,
                     leave_time=leave,
                     travel_seconds=edge.seconds,
@@ -321,7 +425,7 @@ class RouteEngine:
                 )
             )
             clock = leave
-            current = edge.dst
+            current = next_node
 
         return Route(
             origin=origin,
@@ -425,20 +529,23 @@ class RouteEngine:
             if (t, seq) not in labels.get((u, k), ()):
                 continue  # 已被支配后移除的过期标签
 
-            for edge in self._neighbors(u, avoid_stairs):
-                enter = self.earliest_departure(edge, t)
+            for edge, reversed_dir in self._options(u, avoid_stairs):
+                enter = self.earliest_enter(edge, t, reversed_dir)
+                if enter is None:
+                    continue
+                v = edge.src if reversed_dir else edge.dst
                 leave = enter + edge.seconds
                 if leave > deadline:
                     continue  # 不可能参与“最早到达”的路线
                 nk, nt = k, leave
-                if nk < len(stops) and stops[nk].node == edge.dst:
-                    nk, nt, visits = self._stays_at(edge.dst, nk, leave, stops)
+                if nk < len(stops) and stops[nk].node == v:
+                    nk, nt, visits = self._stays_at(v, nk, leave, stops)
                     if visits is None or nt > deadline:
                         continue  # 窗口不可行或注定超过最早到达
                 new_seq = seq + (edge.id,)
                 new_label = (nt, new_seq)
 
-                state = (edge.dst, nk)
+                state = (v, nk)
                 existing = labels[state]
                 if any(self._dominates(et, es, nt, new_seq) for et, es in existing):
                     continue
@@ -447,7 +554,7 @@ class RouteEngine:
                     if not self._dominates(nt, new_seq, et, es)
                 ]
                 labels[state].append(new_label)
-                heapq.heappush(heap, (nt, new_seq, edge.dst, nk))
+                heapq.heappush(heap, (nt, new_seq, v, nk))
 
         best = min(
             labels.get((destination, len(stops)), ()),
@@ -483,13 +590,17 @@ class RouteEngine:
         visits.extend(v0)
         for edge_id in best_seq:
             edge = self._edges[edge_id]
-            enter = self.earliest_departure(edge, clock)
+            reversed_dir = current == edge.dst and current != edge.src
+            enter = self.earliest_enter(edge, clock, reversed_dir)
+            if enter is None:
+                raise NoRouteError("内部错误：获胜序列在重放时不可行")
+            next_node = edge.src if reversed_dir else edge.dst
             leave = enter + edge.seconds
             segments.append(
                 Segment(
                     edge_id=edge.id,
                     from_node=current,
-                    to_node=edge.dst,
+                    to_node=next_node,
                     enter_time=enter,
                     leave_time=leave,
                     travel_seconds=edge.seconds,
@@ -498,7 +609,7 @@ class RouteEngine:
                 )
             )
             clock = leave
-            current = edge.dst
+            current = next_node
             if k < len(stops) and stops[k].node == current:
                 k, clock, vk = self._stays_at(current, k, clock, stops)
                 visits.extend(vk)

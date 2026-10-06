@@ -2,7 +2,9 @@
 
 面向园区访客的**离线**通行规划 HTTP 服务。导入一张带方向、通行秒数、台阶标记的
 步道图，以及按**半开时间区间** `[start, end)` 生效的封闭记录；给定起终点、出发
-时刻与是否避台阶，返回**最早到达**路线及逐段的进入、离开时间。支持在查询中
+时刻与是否避台阶，返回**最早到达**路线及逐段的进入、离开时间。路段还可携带
+**反向通行时间窗**数组：窗内仅允许从原终点走向原起点，窗外仅允许原方向，
+方向按进入路段的时刻判定，封闭记录对两个方向同样全程生效。支持在查询中
 指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节；
 也支持为**多名访客**在候选节点中选择公共汇合点，见第 4.2 节。
 
@@ -76,9 +78,35 @@ python -m app.cli serve
   - `id`：路段编号，**同一版本内唯一**，用于平局字典序比较；
   - `from` / `to`：起终点，必须引用已声明的节点；
   - `travel_seconds`：通行秒数，**正整数**；
-  - `has_stairs`：是否含台阶（布尔）。
+  - `has_stairs`：是否含台阶（布尔）；
+  - `reverse_windows`：**可选**，反向通行时间窗数组，缺省或为空
+    （`[]`/`null`）时行为不变。每项为：
 
-示例见 [`data/graph.example.json`](data/graph.example.json)。
+    ```json
+    {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T13:00:00Z"}
+    ```
+
+    时间格式与封闭记录一致（ISO 8601 或纪元秒），区间为**半开**
+    `[start, end)`，必须 `start < end`；同一数组内各窗**不得重叠**
+    （端点相接，如 `[a,b)` 与 `[b,c)`，允许）。
+
+示例见 [`data/graph.example.json`](data/graph.example.json)；
+带反向窗的示例见
+[`data/graph.reverse-windows.example.json`](data/graph.reverse-windows.example.json)。
+
+#### 反向通行语义
+
+- **窗内只允许反向**：进入时刻落在某个 `[start, end)` 内时，该路段仅可
+  从原终点 `to` 走向原起点 `from`；**窗外只允许原方向**；
+- 方向以**进入路段的时刻**判定；进入后通行途中跨过窗边界（开始或结束）
+  仍按进入时确定的方向走完全程，不会在路中"变回"；
+- 允许在节点等待：窗外可等到窗开放再反向进入；窗内原方向则须等到
+  窗结束；就绪时刻之后再无可用窗的方向不可达；
+- **封闭记录对两个方向同样生效**：整个通行区间
+  `[enter, enter + travel_seconds)` 不得与该边任何封闭区间重叠
+  （半开判定不变），可在节点等待封闭结束——等待封闭可能越过窗边界，
+  系统会重新判定可用方向；
+- 反向通行同样遵守避台阶、最早到达、全程编号序列平局等既有规则。
 
 ### 封闭记录
 
@@ -91,10 +119,11 @@ python -m app.cli serve
 
 ### 通行与等候规则
 
-- 允许在节点等候封闭结束；
+- 允许在节点等候封闭结束，或等候反向时间窗开放/结束；
 - 一条边的整个通行区间 `[enter, enter + travel_seconds)` 不得与该边任何封闭区间重叠，
   不允许“先走进路段、在路中间等”；
-- 寻路时自动计算每段实际进入时刻与等候秒数。
+- 寻路时自动计算每段实际进入时刻与等候秒数；
+- 反向窗的方向判定与等待规则见上文“反向通行语义”。
 
 ---
 
@@ -144,6 +173,10 @@ python -m app.cli serve
 
 - 每段都给出**进入**（`enter_time`，已含节点等候）与**离开**（`leave_time`）时刻，
   以及 `waiting_seconds`；
+- 路段带反向时间窗时，`segments[]` 的 `from_node`/`to_node` 显示该段的
+  **实际通行方向**（反向段即原终点→原起点）；`edge_id` 仍是同一路段编号，
+  `edge_sequence` 平局规则也仍按路段编号。响应字段不新增、不删减，
+  无反向窗数据时结构与旧版完全一致；
 - `data_version` 标明本次查询实际使用的数据版本。
 
 错误：
@@ -340,9 +373,19 @@ curl -X POST http://localhost:8080/admin/graph \
   -d @data/graph.example.json
 ```
 
-校验失败（未知节点引用、非正通行秒数、编号重复等）返回 `400`，响应体含
-`"rejected": true` 与当前仍生效的 `active_version`，**旧版本完整保留**。
-发布成功后旧封闭记录中引用了已删除路段的条目会自动清理。
+校验失败（未知节点引用、非正通行秒数、编号重复、反向时间窗无效或
+同一路段上时间窗重叠等）返回 `400`，响应体含 `"rejected": true` 与
+当前仍生效的 `active_version`，**旧版本完整保留**（包括旧图的节点、
+路段、封闭记录与反向窗）。发布成功后旧封闭记录中引用了已删除路段的
+条目会自动清理；反向窗随新图**整体替换**（新图未携带即清空）。
+
+带反向窗的图导入：
+
+```bash
+curl -X POST http://localhost:8080/admin/graph \
+  -H 'Content-Type: application/json' \
+  -d @data/graph.reverse-windows.example.json
+```
 
 ### `POST /admin/closures` — 原子整体替换封闭记录
 
@@ -357,7 +400,8 @@ curl -X POST http://localhost:8080/admin/closures \
 ### 其他
 
 - `GET /health`：健康检查与当前版本号；
-- `GET /version`：当前版本及节点/路段/封闭数量。
+- `GET /version`：当前版本及节点/路段/封闭/反向窗数量
+  （`reverse_windows` 为反向时间窗总条数）。
 
 ---
 
@@ -405,7 +449,53 @@ curl -s -X POST http://localhost:8080/api/route \
                  "latest_start":"2026-10-05T08:55:00Z",
                  "stay_seconds":60}]}'
 
-# 冒烟自检（需服务已启动）
+# 导入带反向时间窗的步道图（E5 在 11:00–13:00、14:00–16:00 反向）
+curl -s -X POST http://localhost:8080/admin/graph \
+  -H 'Content-Type: application/json' \
+  -d @data/graph.reverse-windows.example.json
+
+# 窗内反向：12:00 从 TOWER 进入 E5（原方向 LAKE->TOWER），12:04 到 LAKE；
+# 逐段 from_node/to_node 显示实际方向 TOWER -> LAKE
+curl -s -X POST http://localhost:8080/api/route \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"TOWER","destination":"LAKE",
+       "departure_time":"2026-10-05T12:00:00Z","avoid_stairs":false}'
+
+# 窗外允许在节点等窗：09:00 出发 -> 等到 11:00 开窗再反向进入
+curl -s -X POST http://localhost:8080/api/route \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"TOWER","destination":"LAKE",
+       "departure_time":"2026-10-05T09:00:00Z","avoid_stairs":false}'
+
+# 方向按进入时刻判定：12:58 反向进入 E5（240 秒），
+# 途中 13:00 窗结束，仍按反向走完，13:02 抵达 LAKE
+curl -s -X POST http://localhost:8080/api/route \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"TOWER","destination":"LAKE",
+       "departure_time":"2026-10-05T12:58:00Z","avoid_stairs":false}'
+
+# 16:30 出发：之后再无反向窗，TOWER -> LAKE 不可达 → 404 no_route
+curl -s -X POST http://localhost:8080/api/route \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"TOWER","destination":"LAKE",
+       "departure_time":"2026-10-05T16:30:00Z","avoid_stairs":false}'
+
+# 窗内原方向禁行：LAKE 12:00 出发须等到 13:00 窗结束才能走 E5 → 13:04 到
+curl -s -X POST http://localhost:8080/api/route \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"LAKE","destination":"TOWER",
+       "departure_time":"2026-10-05T12:00:00Z","avoid_stairs":false}'
+
+# 反向窗无效（start==end）或重叠 → 400 rejected，active_version 保持不变
+curl -s -X POST http://localhost:8080/admin/graph \
+  -H 'Content-Type: application/json' \
+  -d '{"nodes":["A","B"],"edges":[
+       {"id":"E1","from":"A","to":"B","travel_seconds":100,"has_stairs":false,
+        "reverse_windows":[
+          {"start":"2026-10-05T11:00:00Z","end":"2026-10-05T12:30:00Z"},
+          {"start":"2026-10-05T12:00:00Z","end":"2026-10-05T13:00:00Z"}]}]}'
+
+# 冒烟自检（需服务已启动；内含反向窗导入/拒绝与窗内通行检查）
 python3 scripts/smoke_test.py http://localhost:8080
 ```
 
@@ -501,6 +591,13 @@ print(route["arrival_time"], route["edge_sequence"])
   不可达或晚于最晚汇合时刻的候选；对合格候选取
   `(最晚个人抵达, 抵达时刻总和, 候选节点编号)` 字典序最小者。每段路线的
   个人平局仍按全程路段编号序列处理，汇合点选择本身不改变单人路线语义。
+  反向时间窗对各访客独立生效，逐段结果同样显示其实际通行方向。
+- **反向时间窗**：在节点扩展时，除原方向出边外，配置了反向窗的入边在
+  窗内提供“反向出边”。`(就绪时刻) -> 最早可行进入时刻` 对每个方向都是
+  单调非降函数（FIFO：等待窗开放/封闭结束只会把进入时刻向后推），故
+  时间依赖 Dijkstra 与多标签选路无需改变；方向按进入时刻取定，重放获胜
+  序列时按当时所在节点确定方向。反向窗无效或重叠时图导入在事务前校验
+  失败，整次导入拒绝、旧版本保留。
 - **原子发布与版本一致**：
   - 每次导入（图或封闭）在一个 SQLite 写事务中完成全部校验、复制与版本指针切换，
     失败整体回滚；
@@ -516,15 +613,15 @@ print(route["arrival_time"], route["edge_sequence"])
 app/
   config.py        # 环境变量配置
   timeutil.py      # ISO 8601 <-> 纪元秒（UTC）
-  schemas.py       # 导入/查询负载校验（含停靠点 stops、多人汇合 meeting）
+  schemas.py       # 导入/查询负载校验（含停靠点 stops、多人汇合 meeting、反向窗）
   db.py            # SQLite 版本化与原子发布
-  routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠、多人汇合）
+  routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠、多人汇合、反向窗）
   main.py          # FastAPI 路由
   sample_data.py   # 内置示例数据
   cli.py           # init-db / import-* / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
-tests/             # 标准库 unittest 测试（94 个用例）
+tests/             # 标准库 unittest 测试（121 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -540,4 +637,8 @@ python3 -m unittest discover -s tests -v
 按顺序停靠（窗口等待、顺序约束、全程字典序、起点/终点即站点）、
 多人汇合（候选筛选、汇合时刻/抵达总和/节点编号三级择优、到达后等待、
 逐人避台阶与出发时刻、负载校验）、
+反向时间窗（进入时刻判定方向、途中跨窗边界走完、半开边界、
+封闭对两方向的全程约束、等窗/等封闭、多窗相接与等待下一窗、
+避台阶、与停靠/汇合/字典序平局的组合、逐段实际方向、
+无效/重叠窗拒绝整次导入并保留旧版本、版本快照与复制）、
 无路线、原子发布回滚与版本快照等场景。

@@ -199,6 +199,92 @@ def main() -> int:
     }, expect_status=400)
     assert mb3["error"] == "invalid_payload", mb3
 
+    # 13. 反向时间窗：给 E5(LAKE->TOWER,240s) 增加活动时段反向窗，
+    #     其余路段不变（E4 的封闭引用因此保留）
+    version_before = call("GET", "/version")[1]
+    reverse_graph = {
+        "nodes": ["GATE", "PLAZA", "HILL", "LAKE", "TOWER"],
+        "edges": [
+            {"id": "E1", "from": "GATE", "to": "PLAZA", "travel_seconds": 180, "has_stairs": False},
+            {"id": "E2", "from": "PLAZA", "to": "HILL", "travel_seconds": 240, "has_stairs": True},
+            {"id": "E3", "from": "PLAZA", "to": "LAKE", "travel_seconds": 300, "has_stairs": False},
+            {"id": "E4", "from": "HILL", "to": "TOWER", "travel_seconds": 120, "has_stairs": True},
+            {"id": "E5", "from": "LAKE", "to": "TOWER", "travel_seconds": 240, "has_stairs": False,
+             "reverse_windows": [
+                 {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T13:00:00Z"},
+                 {"start": "2026-10-05T14:00:00Z", "end": "2026-10-05T16:00:00Z"}]},
+            {"id": "E6", "from": "PLAZA", "to": "TOWER", "travel_seconds": 600, "has_stairs": True},
+        ],
+    }
+    status, published = call("POST", "/admin/graph", reverse_graph)
+    assert status == 200, published
+    ver = call("GET", "/version")[1]
+    assert ver["reverse_windows"] == 2, ver
+    print(f"已发布反向窗步道图 v{published['data_version']}")
+
+    # 14. 窗内反向：TOWER 12:00 出发，等 0 秒即反向走 E5 -> 12:04 到 LAKE
+    status, rev = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T12:00:00Z",
+    })
+    assert status == 200, rev
+    (seg,) = rev["segments"]
+    assert seg["edge_id"] == "E5", rev
+    assert (seg["from_node"], seg["to_node"]) == ("TOWER", "LAKE"), seg
+    assert seg["enter_time"] == "2026-10-05T12:00:00Z", seg
+    assert seg["leave_time"] == "2026-10-05T12:04:00Z", seg
+    print("反向窗内通行:", seg["from_node"], "->", seg["to_node"], seg["leave_time"])
+
+    # 15. 窗外反向不可达：09:00 出发需等到 11:00 开窗（允许节点等待），
+    #     11:00 进入、11:04 到达；再测窗结束后的时刻无后续窗可用 → 404
+    status, wait_rev = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T09:00:00Z",
+    })
+    assert wait_rev["segments"][0]["enter_time"] == "2026-10-05T11:00:00Z", wait_rev
+    assert wait_rev["segments"][0]["waiting_seconds"] == 7200, wait_rev
+    status, no_rev = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T16:30:00Z",
+    }, expect_status=404)
+    assert no_rev["error"] == "no_route", no_rev
+    print("窗外反向：等窗开放可走，之后无窗则 404")
+
+    # 16. 窗内原方向禁行：LAKE 12:00 出发须等到 13:00 窗结束再走 E5
+    status, fwd = call("POST", "/api/route", {
+        "origin": "LAKE", "destination": "TOWER",
+        "departure_time": "2026-10-05T12:00:00Z",
+    })
+    (fseg,) = fwd["segments"]
+    assert (fseg["from_node"], fseg["to_node"]) == ("LAKE", "TOWER"), fseg
+    assert fseg["enter_time"] == "2026-10-05T13:00:00Z", fseg
+    assert fseg["waiting_seconds"] == 3600, fseg
+    print("窗内原方向等待至窗结束:", fseg["enter_time"])
+
+    # 17. 反向窗无效 / 重叠 → 拒绝整次导入，保留旧版本
+    bad_rev = json.loads(json.dumps(reverse_graph))
+    bad_rev["edges"][4]["reverse_windows"] = [
+        {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T11:00:00Z"}]
+    status, rejected = call("POST", "/admin/graph", bad_rev, expect_status=400)
+    assert rejected["error"] == "invalid_payload" and rejected["rejected"] is True, rejected
+    overlap = json.loads(json.dumps(reverse_graph))
+    overlap["edges"][4]["reverse_windows"] = [
+        {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T12:30:00Z"},
+        {"start": "2026-10-05T12:00:00Z", "end": "2026-10-05T13:00:00Z"}]
+    status, rejected2 = call("POST", "/admin/graph", overlap, expect_status=400)
+    assert rejected2["active_version"] == published["data_version"], rejected2
+    assert call("GET", "/version")[1]["reverse_windows"] == 2
+    print("无效/重叠反向窗拒绝导入，旧版本保留")
+
+    # 恢复不带反向窗的示例图，避免影响后续重复冒烟
+    call("POST", "/admin/graph", {
+        "nodes": reverse_graph["nodes"],
+        "edges": [{k: v for k, v in e.items() if k != "reverse_windows"}
+                  for e in reverse_graph["edges"]],
+    })
+    assert call("GET", "/version")[1]["reverse_windows"] == 0
+    print("已恢复无反向窗示例图")
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

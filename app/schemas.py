@@ -42,6 +42,46 @@ def _validate_stairs(value: Any) -> bool:
     return value
 
 
+def _normalize_reverse_windows(raw: Any, where: str) -> list[tuple[int, int]]:
+    """校验一条路段上的反向通行时间窗数组。
+
+    每项 ``{"start": ..., "end": ...}`` 使用既有时间格式，区间为半开
+    ``[start, end)`` 且必须 ``start < end``。窗内仅允许从原终点走向原起点，
+    窗外仅允许原方向。同一数组内的时间窗不得重叠（端点相接允许）。
+    返回按开始时刻排序的 ``(start, end)`` 纪元秒元组列表。
+    """
+    if not isinstance(raw, list):
+        raise ValidationError(f"{where}.reverse_windows 必须是数组")
+    windows: list[tuple[int, int]] = []
+    for j, item in enumerate(raw):
+        wwhere = f"{where}.reverse_windows[{j}]"
+        if not isinstance(item, dict):
+            raise ValidationError(f"{wwhere} 必须是对象")
+        if "start" not in item:
+            raise ValidationError(f"{wwhere} 缺少 start")
+        if "end" not in item:
+            raise ValidationError(f"{wwhere} 缺少 end")
+        try:
+            start = parse_time(item["start"])
+            end = parse_time(item["end"])
+        except TimeError as exc:
+            raise ValidationError(f"{wwhere}: {exc}") from None
+        if start >= end:
+            raise ValidationError(
+                f"{wwhere} 无效时间窗: start({item['start']}) 必须早于 end({item['end']})"
+            )
+        windows.append((start, end))
+
+    windows.sort()
+    for (s1, e1), (s2, e2) in zip(windows, windows[1:]):
+        if e1 > s2:
+            raise ValidationError(
+                f"{where} 的反向时间窗存在重叠（半开区间仅允许端点相接）: "
+                f"[{s1}, {e1}) 与 [{s2}, {e2}) 重叠"
+            )
+    return windows
+
+
 def normalize_graph(payload: Any) -> dict:
     """校验步道图导入负载，返回规范化结构。
 
@@ -51,10 +91,16 @@ def normalize_graph(payload: Any) -> dict:
           "nodes": ["gate", "plaza", ...],
           "edges": [
             {"id": "E1", "from": "gate", "to": "plaza",
-             "travel_seconds": 120, "has_stairs": false},
+             "travel_seconds": 120, "has_stairs": false,
+             "reverse_windows": [
+               {"start": "2026-10-05T08:00:00Z",
+                "end": "2026-10-05T09:00:00Z"}]},
             ...
           ]
         }
+
+    每条边可选 ``reverse_windows``：半开 ``[start, end)`` 时间窗数组，
+    窗内仅允许从 ``to`` 反向走向 ``from``；缺省或为空时行为不变。
     """
     data = _require_object(payload, "步道图")
     raw_nodes = data.get("nodes")
@@ -95,6 +141,13 @@ def normalize_graph(payload: Any) -> dict:
         seconds = _validate_seconds(raw["travel_seconds"])
         has_stairs = _validate_stairs(raw.get("has_stairs", False))
 
+        # 反向通行时间窗：缺省（None）与空数组都表示全程仅允许原方向
+        reverse_windows: list[tuple[int, int]] = []
+        if "reverse_windows" in raw and raw["reverse_windows"] is not None:
+            reverse_windows = _normalize_reverse_windows(
+                raw["reverse_windows"], where
+            )
+
         edges.append(
             {
                 "id": edge_id,
@@ -102,6 +155,7 @@ def normalize_graph(payload: Any) -> dict:
                 "dst": dst,
                 "seconds": seconds,
                 "has_stairs": has_stairs,
+                "reverse_windows": reverse_windows,
             }
         )
 

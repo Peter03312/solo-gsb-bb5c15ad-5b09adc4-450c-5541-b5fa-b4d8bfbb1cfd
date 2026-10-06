@@ -142,12 +142,14 @@ async def version():
         init_db(conn)
         snap = get_snapshot(conn)
         if snap is None:
-            return {"data_version": 0, "nodes": 0, "edges": 0, "closures": 0}
+            return {"data_version": 0, "nodes": 0, "edges": 0,
+                    "closures": 0, "reverse_windows": 0}
         return {
             "data_version": snap.version_id,
             "nodes": len(snap.nodes),
             "edges": len(snap.edges),
             "closures": len(snap.closures),
+            "reverse_windows": len(snap.reverse_windows),
         }
     finally:
         conn.close()
